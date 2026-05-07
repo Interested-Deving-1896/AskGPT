@@ -1,4 +1,8 @@
 #!/bin/sh
+#
+# Copyright (c) 2026 James Elstone
+# SPDX-License-Identifier: BSD-3-Clause
+# See LICENSE for full license text.
 
 MODEL="${OPENAI_MODEL:-gpt-5.4-mini}"
 API_URL="${OPENAI_API_URL:-https://api.openai.com/v1/responses}"

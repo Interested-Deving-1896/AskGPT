@@ -1,4 +1,9 @@
 #!/bin/sh
+#
+# Copyright (c) 2026 James Elstone
+# SPDX-License-Identifier: BSD-3-Clause
+# See ../LICENSE for full license text.
+
 set -eu
 
 SCRIPT="${SCRIPT:-./askgpt.sh}"

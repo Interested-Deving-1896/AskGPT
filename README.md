@@ -1,3 +1,9 @@
+<!--
+Copyright (c) 2026 James Elstone
+SPDX-License-Identifier: BSD-3-Clause
+See LICENSE for full license text.
+-->
+
 # askgpt
 
 `askgpt` is a small shell CLI for sending a question plus optional file/stdin context to the OpenAI Responses API.
