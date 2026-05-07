@@ -22,12 +22,20 @@ PREVIEW=0
 COPY_OUTPUT=0
 SAVE_FILE=""
 SYSTEM_TEXT=""
+UPDATE_MODE=0
+UPDATE_FILE=""
+FIRST_FILE=""
+PATCH_ONLY=0
+ASSUME_YES=0
+BACKUP=1
 
 usage() {
   cat <<'EOF'
 Usage:
   askgpt [options] "question"
   askgpt [options] -f file... "question"
+  askgpt -f file -u "change request"
+  askgpt --update file "change request"
   command | askgpt [options] "question"
   askgpt remember: text
   askgpt remember "text"
@@ -42,6 +50,9 @@ Examples:
   askgpt --dry-run -f config.php "Check this before I send it"
   askgpt --stream "Write a short deployment checklist"
   askgpt --save answer.md -f index.php "Review this file"
+  askgpt -f a_file.php -u "Improve the security of this file"
+  askgpt -f NewClass.php -u "Create a new class called Test"
+  askgpt --update a_file.php "Improve the security of this file"
 
 Memory examples:
   askgpt remember: 123789
@@ -64,6 +75,12 @@ Options:
   --json                   Print the full JSON response instead of text
   --save FILE              Save the assistant text to a file
   --copy                   Copy assistant text to the clipboard, when available
+  -u, --update-file        Ask for a patch and update the first -f file
+  --update FILE            Ask for a patch and update this specific file
+  --patch-only             Print the proposed patch but do not apply it
+  -y, --yes                Apply update patch without confirmation
+  --backup                 Create a .bak.TIMESTAMP backup before patching
+  --no-backup              Do not create a backup before patching
   -h, --help               Show this help
 
 Environment:
@@ -201,12 +218,31 @@ validate_input_file() {
   fi
 }
 
+validate_new_update_target() {
+  path="$1"
+  target_dir="$(dirname "$path")"
+
+  [ ! -e "$path" ] || return 0
+  [ -d "$target_dir" ] || die "Update target directory does not exist: $target_dir"
+  [ -w "$target_dir" ] || die "Update target directory is not writable: $target_dir"
+}
+
 append_file_context() {
   file="$1"
   CONTEXT="${CONTEXT}
 
 ===== FILE: ${file} =====
 $(redact_file "$file")
+===== END FILE: ${file} =====
+"
+}
+
+append_new_file_context() {
+  file="$1"
+  CONTEXT="${CONTEXT}
+
+===== FILE: ${file} =====
+[This file does not exist yet. Treat it as a new empty file to create.]
 ===== END FILE: ${file} =====
 "
 }
@@ -261,6 +297,33 @@ copy_to_clipboard() {
   fi
 }
 
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+extract_between_markers() {
+  start_marker="$1"
+  end_marker="$2"
+  source_file="$3"
+
+  sed -n "/^${start_marker}\$/,/^${end_marker}\$/p" "$source_file" | sed '1d;$d'
+}
+
+patch_check() {
+  patch_dir="$1"
+  patch_file="$2"
+
+  if patch -d "$patch_dir" -p1 --dry-run < "$patch_file" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if patch -d "$patch_dir" -p1 -C < "$patch_file" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  return 1
+}
+
 make_payload() {
   stream_flag="$1"
 
@@ -308,6 +371,84 @@ run_stream_request() {
   printf '\n'
 }
 
+handle_update_response() {
+  answer_file="$1"
+  target_file="$2"
+
+  require_command patch
+  require_command basename
+
+  update_dir="$(dirname "$target_file")"
+  update_base="$(basename "$target_file")"
+
+  [ -d "$update_dir" ] || die "Update target directory does not exist: $update_dir"
+  if [ -e "$target_file" ]; then
+    [ -f "$target_file" ] || die "Update target is not a regular file: $target_file"
+    [ -w "$target_file" ] || die "Update target is not writable: $target_file"
+  else
+    [ -w "$update_dir" ] || die "Update target directory is not writable: $update_dir"
+  fi
+
+  EXPLANATION_TMP="$(mktemp "${TMPDIR:-/tmp}/askgpt.explanation.XXXXXX")" || die "Could not create temporary explanation file."
+  DIFF_TMP="$(mktemp "${TMPDIR:-/tmp}/askgpt.diff.XXXXXX")" || die "Could not create temporary diff file."
+
+  extract_between_markers "--- ASKGPT_EXPLANATION_START ---" "--- ASKGPT_EXPLANATION_END ---" "$answer_file" > "$EXPLANATION_TMP"
+  extract_between_markers "--- ASKGPT_DIFF_START ---" "--- ASKGPT_DIFF_END ---" "$answer_file" > "$DIFF_TMP"
+
+  if [ ! -s "$DIFF_TMP" ]; then
+    echo "The API response did not contain a usable patch. Full response follows:" >&2
+    cat "$answer_file" >&2
+    exit 1
+  fi
+
+  if [ -s "$EXPLANATION_TMP" ]; then
+    cat "$EXPLANATION_TMP"
+    printf '\n'
+  else
+    cat "$answer_file"
+    printf '\n'
+  fi
+
+  echo "Proposed patch:"
+  cat "$DIFF_TMP"
+
+  if [ "$PATCH_ONLY" -eq 1 ]; then
+    echo "Patch not applied because --patch-only was used." >&2
+    return 0
+  fi
+
+  if ! patch_check "$update_dir" "$DIFF_TMP"; then
+    echo "Patch did not apply cleanly. No files were changed." >&2
+    exit 1
+  fi
+
+  if [ "$ASSUME_YES" -ne 1 ]; then
+    printf 'Apply changes to %s? [y/N] ' "$target_file" >&2
+    IFS= read -r reply
+    case "$reply" in
+      y|Y|yes|YES)
+        ;;
+      *)
+        echo "Patch not applied." >&2
+        return 0
+        ;;
+    esac
+  fi
+
+  if [ "$BACKUP" -eq 1 ]; then
+    if [ -e "$target_file" ]; then
+      backup_file="${target_file}.bak.$(date '+%Y%m%d%H%M%S')"
+      cp "$target_file" "$backup_file" || die "Could not create backup: $backup_file"
+      echo "Backup created: $backup_file" >&2
+    else
+      echo "No backup created because this is a new file." >&2
+    fi
+  fi
+
+  patch -d "$update_dir" -p1 < "$DIFF_TMP" >/dev/null || die "Patch failed while applying changes."
+  echo "Updated: $target_file" >&2
+}
+
 check_dependencies
 ensure_memory_file
 
@@ -335,6 +476,9 @@ while [ $# -gt 0 ]; do
       esac
       FILES="${FILES}
 $1"
+      if [ -z "$FIRST_FILE" ]; then
+        FIRST_FILE="$1"
+      fi
       ;;
     --max-bytes)
       shift
@@ -380,6 +524,32 @@ $(redact_file "$1")"
       ;;
     --copy)
       COPY_OUTPUT=1
+      ;;
+    -u|--update-file)
+      UPDATE_MODE=1
+      ;;
+    --update)
+      shift
+      [ -n "$1" ] || die "Missing file after --update"
+      UPDATE_MODE=1
+      UPDATE_FILE="$1"
+      if [ -z "$FIRST_FILE" ]; then
+        FIRST_FILE="$1"
+      fi
+      FILES="${FILES}
+$1"
+      ;;
+    --patch-only)
+      PATCH_ONLY=1
+      ;;
+    -y|--yes)
+      ASSUME_YES=1
+      ;;
+    --backup)
+      BACKUP=1
+      ;;
+    --no-backup)
+      BACKUP=0
       ;;
     --)
       shift
@@ -448,12 +618,32 @@ case "$PROMPT" in
     ;;
 esac
 
+if [ "$UPDATE_MODE" -eq 1 ] && [ -z "$UPDATE_FILE" ]; then
+  UPDATE_FILE="$FIRST_FILE"
+fi
+
+UPDATE_TARGET_EXISTS=1
+if [ "$UPDATE_MODE" -eq 1 ]; then
+  [ "$STREAM" -eq 0 ] || die "--stream cannot be used with --update-file."
+  [ "$JSON_OUTPUT" -eq 0 ] || die "--json cannot be used with --update-file."
+  require_command basename
+  require_command patch
+  [ -n "$UPDATE_FILE" ] || die "--update-file needs at least one -f file, or use --update FILE."
+
+  if [ -e "$UPDATE_FILE" ]; then
+    validate_input_file "$UPDATE_FILE" "$UPDATE_FILE"
+  else
+    UPDATE_TARGET_EXISTS=0
+    validate_new_update_target "$UPDATE_FILE"
+  fi
+fi
+
 STDIN_TEXT=""
 STDIN_TMP=""
 
 if [ ! -t 0 ]; then
   STDIN_TMP="$(mktemp "${TMPDIR:-/tmp}/askgpt.stdin.XXXXXX")" || die "Could not create temporary stdin file."
-  trap 'rm -f "$STDIN_TMP" "$RESPONSE_TMP" "$ANSWER_TMP" "$PAYLOAD_TMP"' EXIT HUP INT TERM
+  trap 'rm -f "$STDIN_TMP" "$RESPONSE_TMP" "$ANSWER_TMP" "$PAYLOAD_TMP" "$EXPLANATION_TMP" "$DIFF_TMP"' EXIT HUP INT TERM
   cat > "$STDIN_TMP"
   validate_input_file "$STDIN_TMP" "STDIN"
   STDIN_TEXT="$(redact_file "$STDIN_TMP")"
@@ -468,10 +658,16 @@ if [ -n "$FILES" ]; then
 '
   for file in $FILES; do
     [ -z "$file" ] && continue
-    validate_input_file "$file" "$file"
-    append_file_context "$file"
-    ATTACHMENT_SUMMARY="${ATTACHMENT_SUMMARY}
+    if [ "$UPDATE_MODE" -eq 1 ] && [ "$file" = "$UPDATE_FILE" ] && [ "$UPDATE_TARGET_EXISTS" -eq 0 ]; then
+      append_new_file_context "$file"
+      ATTACHMENT_SUMMARY="${ATTACHMENT_SUMMARY}
+  new file target: $file (0 bytes)"
+    else
+      validate_input_file "$file" "$file"
+      append_file_context "$file"
+      ATTACHMENT_SUMMARY="${ATTACHMENT_SUMMARY}
   file: $file ($(byte_count "$file") bytes)"
+    fi
   done
   IFS="$OLD_IFS"
 fi
@@ -489,6 +685,28 @@ fi
 
 if [ -z "$PROMPT" ]; then
   PROMPT="Please analyse the provided content."
+fi
+
+if [ "$UPDATE_MODE" -eq 1 ]; then
+  UPDATE_DIR="$(dirname "$UPDATE_FILE")"
+  UPDATE_BASE="$(basename "$UPDATE_FILE")"
+
+  SYSTEM_TEXT="${SYSTEM_TEXT}
+
+You are helping update a local source file. Preserve the user's ability to review the conversation.
+Return exactly this structure:
+--- ASKGPT_EXPLANATION_START ---
+Briefly explain what you changed and why. Mention important risks or follow-up manual checks.
+--- ASKGPT_EXPLANATION_END ---
+--- ASKGPT_DIFF_START ---
+A unified diff only. The diff must update exactly one file. Use these exact diff headers:
+--- a/${UPDATE_BASE}
++++ b/${UPDATE_BASE}
+Use enough context for patch(1) to apply cleanly from directory: ${UPDATE_DIR}
+If the target file does not exist yet, create it in the diff using /dev/null as the old file if needed, and b/${UPDATE_BASE} as the new file.
+--- ASKGPT_DIFF_END ---
+
+Do not include markdown fences around the diff. Do not edit unrelated files. Do not omit the diff markers."
 fi
 
 MEMORY_CONTEXT=""
@@ -546,7 +764,7 @@ fi
 PAYLOAD_TMP="$(mktemp "${TMPDIR:-/tmp}/askgpt.payload.XXXXXX")" || die "Could not create temporary payload file."
 RESPONSE_TMP="$(mktemp "${TMPDIR:-/tmp}/askgpt.response.XXXXXX")" || die "Could not create temporary response file."
 ANSWER_TMP="$(mktemp "${TMPDIR:-/tmp}/askgpt.answer.XXXXXX")" || die "Could not create temporary answer file."
-trap 'rm -f "$STDIN_TMP" "$RESPONSE_TMP" "$ANSWER_TMP" "$PAYLOAD_TMP"' EXIT HUP INT TERM
+trap 'rm -f "$STDIN_TMP" "$RESPONSE_TMP" "$ANSWER_TMP" "$PAYLOAD_TMP" "$EXPLANATION_TMP" "$DIFF_TMP"' EXIT HUP INT TERM
 
 if [ "$STREAM" -eq 1 ]; then
   make_payload true > "$PAYLOAD_TMP"
@@ -598,6 +816,24 @@ if [ ! -s "$ANSWER_TMP" ]; then
   echo "Unexpected API response:" >&2
   cat "$RESPONSE_TMP" >&2
   exit 1
+fi
+
+if [ "$UPDATE_MODE" -eq 1 ]; then
+  handle_update_response "$ANSWER_TMP" "$UPDATE_FILE"
+
+  if [ -n "$SAVE_FILE" ]; then
+    save_dir="$(dirname "$SAVE_FILE")"
+    if [ "$save_dir" != "." ] && [ ! -d "$save_dir" ]; then
+      mkdir -p "$save_dir" || die "Could not create directory for --save: $save_dir"
+    fi
+    cp "$ANSWER_TMP" "$SAVE_FILE" || die "Could not save response to: $SAVE_FILE"
+  fi
+
+  if [ "$COPY_OUTPUT" -eq 1 ]; then
+    copy_to_clipboard "$ANSWER_TMP"
+  fi
+
+  exit 0
 fi
 
 cat "$ANSWER_TMP"

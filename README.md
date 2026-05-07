@@ -30,6 +30,46 @@ chmod 600 "$HOME/.config/openai/api_key"
 ./askgpt.sh --json "Return a test answer"
 ./askgpt.sh --no-memory "Ignore saved notes"
 ./askgpt.sh --max-bytes 2097152 -f large.log "Summarise this"
+./askgpt.sh -f a_file.php -u "Improve the security of this file"
+./askgpt.sh --update a_file.php --patch-only "Show a safer version as a patch"
+./askgpt.sh -f NewClass.php -u "Create a new class called Test"
+```
+
+## Updating Files
+
+Use `-u` or `--update-file` to ask for a patch against the first file passed with `-f`:
+
+```sh
+./askgpt.sh -f ~/a_file.php -u "Improve the security of this file"
+```
+
+Use `--update FILE` when you want to target one file while also sending extra context:
+
+```sh
+./askgpt.sh --update app.php -f config.php "Improve app.php using config.php as context"
+```
+
+Update mode keeps the conversation visible. It prints the assistant's explanation, prints the proposed unified diff, checks that the patch applies cleanly, creates a timestamped `.bak` backup, and asks before changing the file.
+
+If the update target does not exist yet, update mode treats it as a new empty file:
+
+```sh
+./askgpt.sh -f ~/NewClass.php -u "Create a new class called Test"
+./askgpt.sh --update ~/NewClass.php "Create a new class called Test"
+```
+
+Supporting context files still need to exist. For example, this creates `NewClass.php` while using `BaseModel.php` as context:
+
+```sh
+./askgpt.sh --update NewClass.php -f BaseModel.php "Create a Test class following the existing style"
+```
+
+Useful update options:
+
+```sh
+./askgpt.sh -f app.php -u --patch-only "Show the patch but do not apply it"
+./askgpt.sh -f app.php -u --yes "Apply the patch without asking"
+./askgpt.sh -f app.php -u --no-backup "Apply without creating a backup"
 ```
 
 ## Memory
@@ -73,6 +113,7 @@ The script:
 - Refuses binary files.
 - Enforces a per-input byte limit.
 - Supports `--dry-run` so you can inspect exactly what would be sent.
+- Applies file updates and new-file creation as reviewable unified diffs, with a dry-run check first.
 - Handles API HTTP errors and OpenAI error payloads with non-zero exits.
 - Uses curl timeouts and retries for transient failures.
 
