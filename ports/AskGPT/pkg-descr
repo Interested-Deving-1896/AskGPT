@@ -1,0 +1,4 @@
+askgpt is a small POSIX shell command line client for sending a prompt,
+optional file context, and optional standard input context to the OpenAI
+Responses API. It supports local memory, request previewing, streaming
+responses, saving output, and reviewable unified-diff file updates.
